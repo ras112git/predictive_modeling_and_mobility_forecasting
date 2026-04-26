@@ -1,0 +1,25 @@
+# Data
+data/raw/
+data/interim/
+data/processed/
+*.csv
+*.xlsx
+
+# Models
+models/
+*.pkl
+*.h5
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environments and secrets
+venv/
+.env
+*.key
+
+# Other
+CLAUDE.md
