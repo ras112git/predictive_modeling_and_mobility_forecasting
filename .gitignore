@@ -18,8 +18,10 @@ __pycache__/
 
 # Environments and secrets
 venv/
+.venv/
 .env
 *.key
 
 # Other
 CLAUDE.md
+.vscode/
