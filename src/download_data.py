@@ -1,34 +1,44 @@
-"""Downloads the raw dataset from Google Drive."""
+"""Downloads the raw datasets from Google Drive."""
 
 import os
 import gdown
 
-# Google Drive file ID (from the shared link)
-FILE_ID = "1Lz8JSqtcUT9mBfTz0rOf9KkmRSxf5k5t"
-RAW_DATA_PATH = "data/raw/dataset.csv"
+# Map of output filename -> Google Drive file ID (from the shared link)
+FILES = {
+    "dataset_train.csv": "13p_DwfnywGNLFgovm_RWRs-ZnKsEjPdc",
+    "dataset_test.csv": "1xTFvlyL-te42wvR3s-NN02qNGtz1VqOQ",
+}
+RAW_DATA_DIR = "data/raw"
 
-def download_raw_data(force: bool = False) -> str:
+
+def download_raw_data(force: bool = False) -> list[str]:
     """
-    Download the raw dataset from Google Drive into data/raw/.
+    Download the raw datasets from Google Drive into data/raw/.
 
     Args:
-        force: If True, re-download even if the file already exists.
+        force: If True, re-download even if a file already exists.
 
     Returns:
-        The path to the downloaded file.
+        The paths to the downloaded files.
     """
-    os.makedirs("data/raw", exist_ok=True)
+    os.makedirs(RAW_DATA_DIR, exist_ok=True)
 
-    if os.path.exists(RAW_DATA_PATH) and not force:
-        print(f"Raw data already exists at {RAW_DATA_PATH}, skipping download.")
-        return RAW_DATA_PATH
+    paths = []
+    for filename, file_id in FILES.items():
+        path = os.path.join(RAW_DATA_DIR, filename)
 
-    url = f"https://drive.google.com/uc?id={FILE_ID}"
-    print(f"Downloading raw data from Google Drive...")
-    gdown.download(url, RAW_DATA_PATH, quiet=False)
-    print(f"Saved to {RAW_DATA_PATH}")
+        if os.path.exists(path) and not force:
+            print(f"Raw data already exists at {path}, skipping download.")
+            paths.append(path)
+            continue
 
-    return RAW_DATA_PATH
+        url = f"https://drive.google.com/uc?id={file_id}"
+        print(f"Downloading {filename} from Google Drive...")
+        gdown.download(url, path, quiet=False)
+        print(f"Saved to {path}")
+        paths.append(path)
+
+    return paths
 
 
 if __name__ == "__main__":

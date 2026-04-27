@@ -37,7 +37,7 @@ Google Drive (raw data, shared)
         ↓
    download_data.py   ← fetches into data/raw/
         ↓
-   data/raw/dataset.csv   (gitignored, exists locally only)
+   data/raw/dataset_train.csv, data/raw/dataset_test.csv   (gitignored, exist locally only)
         ↓
    clean_data.py     ← transforms raw into clean
         ↓
