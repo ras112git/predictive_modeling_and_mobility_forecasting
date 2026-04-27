@@ -5,3 +5,5 @@ fastbook
 pathlib
 numpy 
 holidays
+sklearn
+joblib
