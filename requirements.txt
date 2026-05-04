@@ -3,3 +3,7 @@ pandas
 scikit-learn
 fastbook
 pathlib
+numpy 
+holidays
+sklearn
+joblib
