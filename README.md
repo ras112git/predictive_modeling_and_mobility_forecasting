@@ -17,6 +17,7 @@ predictive_modeling_and_mobility_forecasting/
 │   └── 03_modeling.ipynb
 │
 ├── src/                       # Reusable Python code (.py files)
+│   ├── download_data.py
 │   ├── data_cleaning.py
 │   ├── features.py
 │   └── model.py
@@ -53,3 +54,11 @@ Google Drive (raw data, shared)
 
 This downloads the raw data from our shared Google Drive into `data/raw/`
 and produces a cleaned version in `data/processed/`.
+
+## Data description
+
+The data correspond to thousands of bike trips for the nextbike-system in Vienna. It only contains entries for station-interval combinations for which data was observed.
+
+- `dataset_train.csv` - the training set, containing data from `2024-09-03 17:30:00` to `2025-03-06 10:00:00`
+
+- `dataset_test.csv` - the test set, containing data from `2025-03-06 10:30:00` to `2025-04-29 23:30:00`

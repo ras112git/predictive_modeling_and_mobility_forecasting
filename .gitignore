@@ -25,3 +25,4 @@ venv/
 # Other
 CLAUDE.md
 .vscode/
+.claude
