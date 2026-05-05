@@ -15,15 +15,24 @@ def clean_data(dataset, is_train: bool):
     Returns:
     Cleaned dataset
     """
-
     dataset = dataset.copy()
     
     #Transform the datetime, needed for the submission file, the localize makes sure that the format is correct (rather than having the UCT reference)
     dataset['datetime'] = pd.to_datetime(dataset['datetime'], utc=True).dt.tz_localize(None)  
 
-    # The insert method takes (position_index, column_name, values)
-    dataset.insert(0, 'id', dataset.iloc[:, 0].astype(str) + "_" + dataset.iloc[:, 1].astype(str))
+    # Boolean check, that it is true when hour, minute and second are all 0
+    is_midnight = (dataset['datetime'].dt.hour == 0) & (dataset['datetime'].dt.minute == 0) & (dataset['datetime'].dt.second == 0)
     
+    # What where does is, that when it is midnight, then it 
+    datetime_str = np.where(
+        is_midnight,
+        dataset['datetime'].dt.strftime('%Y-%m-%d'),
+        dataset['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    )
+
+    # The insert method takes (position_index, column_name, values)
+    dataset.insert(0, 'id', datetime_str + "_" + dataset.iloc[:, 1].astype(str))
+
     if is_train:    
         # If there are rows with NA, then drop them
         if dataset.isna().any(axis=1).any():
