@@ -1,4 +1,4 @@
-gdown
+kagglehub
 pandas
 scikit-learn
 fastbook
