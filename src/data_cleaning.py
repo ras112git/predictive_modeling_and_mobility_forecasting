@@ -57,8 +57,9 @@ def clean_data(dataset, is_train: bool):
     at_holidays = holidays.Austria(subdiv='9') #subdiv = 9 locates the specific holidays of viena
 
 
-    # Create the holiday column
+    # Create the holiday column, also transform it into discrete
     dataset['is_holiday'] = dataset['datetime'].dt.date.apply(lambda x: x in at_holidays)
+    dataset['is_holiday'] = dataset['is_holiday'].astype(int)
 
     return dataset
 
