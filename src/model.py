@@ -160,7 +160,7 @@ def benchmark_models(
         RandomizedSearchCV, TimeSeriesSplit, KFold,
     )
     from sklearn.metrics import (
-        mean_squared_error, mean_absolute_error, mean_poisson_deviance,
+        mean_squared_error, mean_absolute_error, mean_poisson_deviance,mean_squared_log_error
     )
 
     if models is None:
@@ -176,7 +176,7 @@ def benchmark_models(
 
     rows = []
     for name, (estimator, param_dist) in models.items():
-        rmses, maes, devs, best_params = [], [], [], []
+        rmses, maes, rmsles, devs, best_params = [], [], [], [], []
 
         for fold_idx, (tr_idx, te_idx) in enumerate(outer.split(X)):
             X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
@@ -200,6 +200,7 @@ def benchmark_models(
 
             rmses.append(np.sqrt(mean_squared_error(y_te, y_pred)))
             maes.append(mean_absolute_error(y_te, y_pred))
+            rmsles.append(np.sqrt(mean_squared_log_error(y_te, y_pred)))
             # mean_poisson_deviance requires y_pred > 0
             devs.append(mean_poisson_deviance(y_te, np.maximum(1e-9, y_pred)))
             best_params.append(search.best_params_)
@@ -207,7 +208,7 @@ def benchmark_models(
             if verbose:
                 print(
                     f"  {name} fold {fold_idx + 1}/{outer_splits}: "
-                    f"RMSE={rmses[-1]:.3f}  MAE={maes[-1]:.3f}"
+                    f"RMSE={rmses[-1]:.3f}  MAE={maes[-1]:.3f} RMSLE={rmsles[-1]:.3f}"
                 )
 
         rows.append({
@@ -215,6 +216,8 @@ def benchmark_models(
             "mean_rmse": float(np.mean(rmses)),
             "std_rmse": float(np.std(rmses)),
             "mean_mae": float(np.mean(maes)),
+            "mean_rmsle": float(np.mean(rmsles)),
+            "std_rmsle": float(np.std(rmsles)),
             "mean_poisson_deviance": float(np.mean(devs)),
             "rmse_per_fold": rmses,
             "best_params_per_fold": best_params,
