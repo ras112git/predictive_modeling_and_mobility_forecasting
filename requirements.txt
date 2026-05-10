@@ -1,10 +1,9 @@
 kagglehub
 pandas
 scikit-learn
-fastbook
 pathlib
 numpy 
 holidays
 joblib
 xgboost
-lightgbm 
+lightgbm

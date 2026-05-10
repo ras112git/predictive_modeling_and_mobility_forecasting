@@ -1,12 +1,20 @@
-# Constants
-DROP_COLS = ["id", "datetime", "name", "lat", "lng"]
-TARGET = "bikes"
-
-def prepare_features(df, drop_cols=DROP_COLS, target=TARGET):
+def data_split(df, target):
     """Split a cleaned dataframe into (X, y). Returns (X, y)."""
-    X = df.drop(columns=drop_cols + [target])
+    X = df.drop(columns = target)
     y = df[target]
     return X, y
+
+def prepare_features(X, drop_cols):
+    """Drop identifier columns and cast station_number to pandas `category`.
+
+    The categorical dtype is what LightGBM, XGBoost (with enable_categorical)
+    and HistGradientBoosting auto-detect as a categorical feature, so the
+    modeling code doesn't need a separate `categorical_feature` argument.
+    """
+    X = X.drop(columns=drop_cols)
+    if 'station_number' in X.columns:
+        X = X.assign(station_number=X['station_number'].astype('category'))
+    return X
 
 
 def feature_selection_report(X, y, sample_size=100_000, random_state=42):
@@ -19,9 +27,16 @@ def feature_selection_report(X, y, sample_size=100_000, random_state=42):
     X_sample = X.sample(n=sample_size, random_state=random_state)
     y_sample = y.loc[X_sample.index]
 
-    discrete_cols = {'station_number', 'minute', 'dayofweek', 
-                 'month', 'is_weekend', 'is_holiday', 'hour'}
-    discrete_mask = [col in discrete_cols for col in X_sample.columns]
+    has_station = 'station_number' in X.columns
+
+    if has_station:
+        discrete_cols = {'station_number','minute', 'dayofweek', 
+                    'month', 'is_weekend', 'is_holiday', 'hour'}
+    else:
+        discrete_cols = {'minute', 'dayofweek', 
+            'month', 'is_weekend', 'is_holiday', 'hour'} 
+    
+    discrete_mask = [col in discrete_cols or col.startswith('st_') for col in X_sample.columns]
 
     mi = mutual_info_regression(
     X_sample, y_sample,
@@ -30,50 +45,102 @@ def feature_selection_report(X, y, sample_size=100_000, random_state=42):
 
     return mi
 
-def get_model_grid(random_state=42):
+def get_model_grid(Feature_df, random_state=42):
     """Return a dict {name: (estimator, param_distribution)} for the benchmark.
 
-    Each param_distribution is small (3-4 hyperparameters, narrow ranges) so a
-    RandomizedSearchCV with ~5-10 iterations can cover a useful slice of it.
-
-    All tree models use a Poisson objective/criterion to match the count
-    nature of `bikes` (non-negative integers). This guarantees non-negative
-    predictions and is more principled than squared error for count data.
-
-    Imports for xgboost and lightgbm are lazy so the rest of this module
-    keeps working even if those packages are not installed yet.
+    Tree models use a Poisson objective/criterion for the count target.
+    `station_number` is handled natively by hist_gbm/xgboost/lightgbm, and
+    target-encoded (CV-safe, mean bikes per station with empirical-Bayes
+    shrinkage) for decision_tree and random_forest, which don't support
+    categorical splits.
     """
     from sklearn.tree import DecisionTreeRegressor
     from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+    from sklearn.preprocessing import TargetEncoder
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
     from xgboost import XGBRegressor
     from lightgbm import LGBMRegressor
     from sklearn.dummy import DummyRegressor
+
+    has_station = 'station_number' in Feature_df.columns
+
+    # --- Native-categorical model params ---
+    xgb_params = dict(
+        objective="count:poisson",
+        tree_method="hist",
+        n_jobs=-2,
+        random_state=random_state,
+    )
+    lgbm_params = dict(
+        objective="poisson",
+        n_jobs=-2,
+        random_state=random_state,
+        verbose=-1,
+    )
+    hgb_params = dict(loss="poisson", random_state=random_state)
+
+    if has_station:
+        # All three rely on pandas `category` dtype on station_number, which
+        # prepare_features() sets. LightGBM auto-detects category dtype, so no
+        # explicit categorical_feature argument is needed (and passing one in
+        # the constructor dict triggers a warning + gets overridden).
+        xgb_params["enable_categorical"] = True
+        hgb_params["categorical_features"] = ['station_number']
+
+    # --- Helper: wrap an estimator so station_number gets target-encoded
+    #     and everything else is passed through. ColumnTransformer is
+    #     re-fit on each CV split, so the encoding is leak-free.
+    def wrap_with_te(estimator):
+        if not has_station:
+            return estimator
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("station_te", TargetEncoder(
+                    target_type="continuous",
+                    smooth="auto",
+                    random_state=random_state,
+                ), ["station_number"]),
+            ],
+            remainder="passthrough",
+            verbose_feature_names_out=False,
+        )
+        return Pipeline([
+            ("preprocess", preprocessor),
+            ("model", estimator),
+        ])
+
+    # When wrapped in a Pipeline, hyperparameters need a "model__" prefix
+    # so RandomizedSearchCV / set_params() route them to the inner step.
+    prefix = "model__" if has_station else ""
+
     return {
         "Featureless": (
             DummyRegressor(),
             {"strategy": ["mean", "median"]},
         ),
-
         "decision_tree": (
-            DecisionTreeRegressor(criterion="poisson", random_state=random_state),
+            wrap_with_te(DecisionTreeRegressor(
+                criterion="poisson", random_state=random_state,
+            )),
             {
-                "max_depth": [10, 15, 20, None],
-                "min_samples_leaf": [5, 10, 20, 50],
+                f"{prefix}max_depth": [10, 15, 20, None],
+                f"{prefix}min_samples_leaf": [5, 10, 20, 50],
             },
         ),
         "random_forest": (
-            RandomForestRegressor(
-                criterion="poisson", n_jobs=-2, random_state=random_state
-            ),
+            wrap_with_te(RandomForestRegressor(
+                criterion="poisson", n_jobs=-2, random_state=random_state,
+            )),
             {
-                "n_estimators": [100, 200],
-                "max_depth": [None, 15, 25],
-                "min_samples_leaf": [5, 10, 20],
-                "max_features": ["sqrt", 0.5, 1.0],
+                f"{prefix}n_estimators": [100, 200],
+                f"{prefix}max_depth": [None, 15, 25],
+                f"{prefix}min_samples_leaf": [5, 10, 20],
+                f"{prefix}max_features": ["sqrt", 0.5, 1.0],
             },
         ),
         "hist_gbm": (
-            HistGradientBoostingRegressor(loss="poisson", random_state=random_state),
+            HistGradientBoostingRegressor(**hgb_params),
             {
                 "max_iter": [100, 200, 300],
                 "learning_rate": [0.05, 0.1, 0.2],
@@ -82,12 +149,7 @@ def get_model_grid(random_state=42):
             },
         ),
         "xgboost": (
-            XGBRegressor(
-                objective="count:poisson",
-                tree_method="hist",
-                n_jobs=-2,
-                random_state=random_state,
-            ),
+            XGBRegressor(**xgb_params),
             {
                 "n_estimators": [100, 300],
                 "learning_rate": [0.05, 0.1],
@@ -96,12 +158,7 @@ def get_model_grid(random_state=42):
             },
         ),
         "lightgbm": (
-            LGBMRegressor(
-                objective="poisson",
-                n_jobs=-2,
-                random_state=random_state,
-                verbose=-1,
-            ),
+            LGBMRegressor(**lgbm_params),
             {
                 "n_estimators": [100, 300],
                 "learning_rate": [0.05, 0.1],
@@ -111,10 +168,87 @@ def get_model_grid(random_state=42):
         ),
     }
 
+def get_final_param_grid(Feature_df, model_name):
+    """Return a wider param distribution for the winning model.
 
-def get_final_param_grid(model_name):
-    """Return a wider param distribution for the winning model,
-    suitable for the final 30-50 iteration RandomizedSearchCV."""
+    Sized for a final RandomizedSearchCV with ~40 iterations: each grid
+    covers 5-9 hyperparameters with ranges roughly 2-3x wider than the
+    benchmark grid in `get_model_grid`. Param names are model-specific
+    (e.g. `num_leaves` only for LightGBM, `max_features` only for tree/RF).
+
+    Args:
+        model_name: key from `get_model_grid()` — also matches the values
+            in the `model` column of the benchmark ranking DataFrame.
+
+    Returns:
+        Dict suitable as the `param_distributions` argument of
+        RandomizedSearchCV.
+
+    Raises:
+        KeyError: if `model_name` is not one of the known models.
+    """
+    grids = {
+        "Featureless": {
+            "strategy": ["mean", "median"],
+        },
+        "decision_tree": {
+            "max_depth": [None, 8, 12, 15, 20, 25, 30],
+            "min_samples_leaf": [1, 5, 10, 20, 50, 100],
+            "min_samples_split": [2, 5, 10, 20],
+            "max_features": [None, "sqrt", 0.5, 0.7, 1.0],
+        },
+        "random_forest": {
+            "n_estimators": [200, 400, 600, 800],
+            "max_depth": [None, 10, 15, 20, 25, 30],
+            "min_samples_leaf": [1, 5, 10, 20, 50],
+            "min_samples_split": [2, 5, 10],
+            "max_features": ["sqrt", 0.3, 0.5, 0.7, 1.0],
+        },
+        "hist_gbm": {
+            "max_iter": [200, 400, 600, 800, 1000],
+            "learning_rate": [0.01, 0.03, 0.05, 0.1, 0.15],
+            "max_depth": [None, 6, 8, 10, 12, 15],
+            "min_samples_leaf": [10, 20, 50, 100],
+            "max_leaf_nodes": [15, 31, 63, 127],
+            "l2_regularization": [0.0, 0.1, 1.0, 10.0],
+        },
+        "xgboost": {
+            "n_estimators": [200, 400, 600, 800, 1000],
+            "learning_rate": [0.01, 0.03, 0.05, 0.1, 0.15],
+            "max_depth": [4, 6, 8, 10, 12],
+            "min_child_weight": [1, 5, 10, 20],
+            "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "reg_alpha": [0, 0.01, 0.1, 1.0],
+            "reg_lambda": [0, 0.1, 1.0, 10.0],
+            "gamma": [0, 0.1, 0.5, 1.0],
+        },
+        "lightgbm": {
+            "n_estimators": [200, 400, 600, 800, 1000],
+            "learning_rate": [0.01, 0.03, 0.05, 0.1, 0.15],
+            "num_leaves": [31, 63, 127, 255, 511],
+            "max_depth": [-1, 6, 8, 10, 12],
+            "min_child_samples": [5, 10, 20, 50, 100],
+            "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "reg_alpha": [0, 0.01, 0.1, 1.0],
+            "reg_lambda": [0, 0.1, 1.0, 10.0],
+        },
+    }
+    if model_name not in grids:
+        raise KeyError(
+            f"Unknown model '{model_name}'. Expected one of {list(grids)}."
+        )
+    
+    grid = grids[model_name]
+
+    # Pipeline-wrapped models need the model__ prefix
+    has_station = 'station_number' in Feature_df.columns
+
+    if has_station and model_name in {"decision_tree", "random_forest"}:
+        grid = {f"model__{k}": v for k, v in grid.items()}
+    return grid
+
 
 def benchmark_models(
     X,
@@ -123,7 +257,7 @@ def benchmark_models(
     outer_splits=3,
     inner_splits=3,
     n_iter=8,
-    sample_size=None,
+    sample_size=200_000,
     time_aware=True,
     random_state=42,
     verbose=True,
@@ -164,7 +298,7 @@ def benchmark_models(
     )
 
     if models is None:
-        models = get_model_grid(random_state=random_state)
+        models = get_model_grid(Feature_df = X, random_state=random_state)
 
     if sample_size is not None and sample_size < len(X):
         X = X.sample(n=sample_size, random_state=random_state).sort_index()
@@ -188,7 +322,7 @@ def benchmark_models(
                 n_iter=n_iter,
                 cv=inner,
                 scoring="neg_root_mean_squared_error",
-                # estimators already use n_jobs=-1; avoid nested parallelism
+                # estimators use n_jobs=-2; Do not use more than n_jobs=1, as it would cause deadlock
                 n_jobs=1,
                 random_state=random_state,
                 refit=True,
@@ -229,12 +363,153 @@ def benchmark_models(
         .reset_index(drop=True)
     )
 
-def train_final_model(X, y, model_name, n_iter=40, cv_splits=3, random_state=42):
-    """Run RandomizedSearchCV with a wider grid on the chosen model.
-    Returns the fitted best_estimator_ and the search object."""
+def train_final_model(
+    X,
+    y,
+    model_name,
+    n_iter=40,
+    cv_splits=3,
+    random_state=42,
+    verbose = True,
+    sample_size = None
+):
+    """Run a manual randomized search with a wider grid on the chosen model.
+
+    Pulls the estimator from `get_model_grid()` and the wider param
+    distribution from `get_final_param_grid()`. Samples `n_iter`
+    configurations via `ParameterSampler`, evaluates each one with
+    TimeSeriesSplit CV, prints a one-line summary as soon as each config
+    finishes, then refits the best config on the full (X, y).
+
+    Why manual instead of RandomizedSearchCV: sklearn's `verbose` only
+    flushes after each fold (and Jupyter often buffers it until fit()
+    returns), so for slow models you see nothing for a long time. The
+    manual loop prints in real time, one line per configuration.
+
+    Args:
+        X, y: features and target. Must already be sorted by datetime —
+            the same expectation as `benchmark_models`.
+        model_name: key into `get_model_grid()` / `get_final_param_grid()`.
+            Typically `benchmark_results.iloc[0]['model']`.
+        n_iter: number of random hyperparameter samples to try.
+        cv_splits: number of TimeSeriesSplit folds.
+        random_state: seed for the sampler and the estimator.
+        verbose: print pre-flight summary, per-config progress, and the
+            final ranked table.
+        sample_size: optional row subsample for development.
+
+    Returns:
+        (best_estimator, search) where `search` is a SimpleNamespace with
+        attributes: `best_estimator_`, `best_params_`, `best_score_`
+        (sklearn convention: negated RMSE), `results_df` (full ranking
+        DataFrame with columns iter, mean_rmse, std_rmse, params,
+        fold_rmses).
+    """
+    import time
+    from types import SimpleNamespace
+
+    import numpy as np
+    import pandas as pd
+    from sklearn.base import clone
+    from sklearn.metrics import mean_squared_error
+    from sklearn.model_selection import ParameterSampler, TimeSeriesSplit
+
+    estimator, _ = get_model_grid(Feature_df=X,random_state=random_state)[model_name]
+    param_dist = get_final_param_grid(Feature_df= X, model_name = model_name)
+
+    if sample_size is not None and sample_size < len(X):
+        
+        X = X.iloc[-sample_size:]
+        y = y.iloc[-sample_size:]
+
+    cv = TimeSeriesSplit(n_splits=cv_splits)
+    sampler = list(
+        ParameterSampler(param_dist, n_iter=n_iter, random_state=random_state)
+    )
+
+    if verbose:
+        print(
+            f"[train_final_model] model={model_name}  rows={len(X):,}  "
+            f"features={X.shape[1]}  n_iter={len(sampler)}  cv_splits={cv_splits}  "
+            f"total_fits={len(sampler) * cv_splits + 1} (incl. final refit)"
+        )
+        print(f"[train_final_model] param grid keys: {sorted(param_dist)}\n")
+
+    rows = []
+    t_start = time.time()
+    for i, params in enumerate(sampler, start=1):
+        t_cfg = time.time()
+        fold_rmses = []
+        for tr_idx, te_idx in cv.split(X):
+            est = clone(estimator).set_params(**params)
+            est.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+            # Poisson-trained models give non-negative preds; clip is defensive.
+            y_pred = np.maximum(0, est.predict(X.iloc[te_idx]))
+            fold_rmses.append(
+                float(np.sqrt(mean_squared_error(y.iloc[te_idx], y_pred)))
+            )
+        mean_rmse = float(np.mean(fold_rmses))
+        std_rmse = float(np.std(fold_rmses))
+        rows.append({
+            "iter": i,
+            "mean_rmse": mean_rmse,
+            "std_rmse": std_rmse,
+            "params": params,
+            "fold_rmses": fold_rmses,
+        })
+        if verbose:
+            print(
+                f"[{i:>3}/{len(sampler)}] mean_rmse={mean_rmse:.4f}  "
+                f"std={std_rmse:.4f}  folds={[f'{r:.3f}' for r in fold_rmses]}  "
+                f"time={time.time() - t_cfg:.1f}s  params={params}",
+                flush=True,
+            )
+
+    results_df = (
+        pd.DataFrame(rows)
+        .sort_values("mean_rmse")
+        .reset_index(drop=True)
+    )
+    best_row = results_df.iloc[0]
+    best_params = best_row["params"]
+
+    if verbose:
+        print(
+            f"\n[train_final_model] search done in {time.time() - t_start:.1f}s. "
+            f"Best mean_rmse={best_row['mean_rmse']:.4f}  params={best_params}"
+        )
+        print("[train_final_model] refitting best config on full (X, y)...")
+
+    best_estimator = clone(estimator).set_params(**best_params)
+    best_estimator.fit(X, y)
+
+    search = SimpleNamespace(
+        best_estimator_=best_estimator,
+        best_params_=best_params,
+        best_score_=-best_row["mean_rmse"],  # sklearn convention: negative
+        results_df=results_df,
+    )
+    return best_estimator, search
 
 def evaluate(model, X, y):
     """Return a dict {rmse, mae, rmsle} for predictions on (X, y)."""
+
+    from sklearn.metrics import mean_absolute_error, mean_squared_error,mean_squared_log_error
+    import numpy as np
+
+    y_pred = model.predict(X)
+
+    print(y_pred)
+
+    # Evaluate
+    mae = mean_absolute_error(y, y_pred)
+    rmse = np.sqrt(mean_squared_error(y, y_pred))
+    rmsle = np.sqrt(mean_squared_log_error(y, y_pred))
+    print(f"MAE:   {mae:.3f}")
+    print(f"RMSE:  {rmse:.3f}")
+    print(f"RMSLE: {rmsle:.3f}")
+
+    return None
 
 def save_model(model, path):
     """joblib.dump wrapper that creates parent directories."""
