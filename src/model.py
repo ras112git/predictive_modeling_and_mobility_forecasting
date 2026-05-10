@@ -198,11 +198,11 @@ def get_final_param_grid(Feature_df, model_name):
             "max_features": [None, "sqrt", 0.5, 0.7, 1.0],
         },
         "random_forest": {
-            "n_estimators": [200, 400, 600, 800],
-            "max_depth": [None, 10, 15, 20, 25, 30],
-            "min_samples_leaf": [1, 5, 10, 20, 50],
+            "n_estimators": [200, 300, 400],
+            "max_depth": [10, 15, 20, 25, 30],
+            "min_samples_leaf": [1, 5, 10],
             "min_samples_split": [2, 5, 10],
-            "max_features": ["sqrt", 0.3, 0.5, 0.7, 1.0],
+            "max_features": ["sqrt", 0.3, 0.5, 0.7],
         },
         "hist_gbm": {
             "max_iter": [200, 400, 600, 800, 1000],
@@ -418,7 +418,7 @@ def train_final_model(
     param_dist = get_final_param_grid(Feature_df= X, model_name = model_name)
 
     if sample_size is not None and sample_size < len(X):
-        
+
         X = X.iloc[-sample_size:]
         y = y.iloc[-sample_size:]
 
