@@ -370,40 +370,17 @@ def train_final_model(
     n_iter=40,
     cv_splits=3,
     random_state=42,
-    verbose = True,
-    sample_size = None
+    verbose=True,
+    sample_size=None,
+    log_target=False,
 ):
     """Run a manual randomized search with a wider grid on the chosen model.
 
-    Pulls the estimator from `get_model_grid()` and the wider param
-    distribution from `get_final_param_grid()`. Samples `n_iter`
-    configurations via `ParameterSampler`, evaluates each one with
-    TimeSeriesSplit CV, prints a one-line summary as soon as each config
-    finishes, then refits the best config on the full (X, y).
-
-    Why manual instead of RandomizedSearchCV: sklearn's `verbose` only
-    flushes after each fold (and Jupyter often buffers it until fit()
-    returns), so for slow models you see nothing for a long time. The
-    manual loop prints in real time, one line per configuration.
-
-    Args:
-        X, y: features and target. Must already be sorted by datetime —
-            the same expectation as `benchmark_models`.
-        model_name: key into `get_model_grid()` / `get_final_param_grid()`.
-            Typically `benchmark_results.iloc[0]['model']`.
-        n_iter: number of random hyperparameter samples to try.
-        cv_splits: number of TimeSeriesSplit folds.
-        random_state: seed for the sampler and the estimator.
-        verbose: print pre-flight summary, per-config progress, and the
-            final ranked table.
-        sample_size: optional row subsample for development.
-
-    Returns:
-        (best_estimator, search) where `search` is a SimpleNamespace with
-        attributes: `best_estimator_`, `best_params_`, `best_score_`
-        (sklearn convention: negated RMSE), `results_df` (full ranking
-        DataFrame with columns iter, mean_rmse, std_rmse, params,
-        fold_rmses).
+    When `log_target=True`, the estimator's loss is switched from Poisson
+    to squared error and the whole thing is wrapped in
+    TransformedTargetRegressor(func=log1p, inverse_func=expm1). CV scoring
+    also switches from RMSE to RMSLE so hyperparameters are picked on the
+    metric Kaggle scores you on.
     """
     import time
     from types import SimpleNamespace
@@ -411,14 +388,42 @@ def train_final_model(
     import numpy as np
     import pandas as pd
     from sklearn.base import clone
-    from sklearn.metrics import mean_squared_error
+    from sklearn.compose import TransformedTargetRegressor
+    from sklearn.metrics import mean_squared_error, mean_squared_log_error
     from sklearn.model_selection import ParameterSampler, TimeSeriesSplit
+    from sklearn.pipeline import Pipeline
 
-    estimator, _ = get_model_grid(Feature_df=X,random_state=random_state)[model_name]
-    param_dist = get_final_param_grid(Feature_df= X, model_name = model_name)
+    estimator, _ = get_model_grid(Feature_df=X, random_state=random_state)[model_name]
+    param_dist = get_final_param_grid(Feature_df=X, model_name=model_name)
+
+    if log_target:
+        # Map each model to the param that controls its loss function.
+        loss_settings = {
+            "decision_tree": ("criterion", "squared_error"),
+            "random_forest": ("criterion", "squared_error"),
+            "hist_gbm":      ("loss",      "squared_error"),
+            "xgboost":       ("objective", "reg:squarederror"),
+            "lightgbm":      ("objective", "regression"),
+        }
+        if model_name in loss_settings:
+            pname, pval = loss_settings[model_name]
+            # DT/RF come back as Pipeline([preprocess, model]) when station_number
+            # is present, so the param is reachable as "model__criterion", this comes 
+            # from the pipeline for decision trees and random forests
+            if isinstance(estimator, Pipeline):
+                pname = f"model__{pname}"
+            estimator = clone(estimator).set_params(**{pname: pval})
+
+        estimator = TransformedTargetRegressor(
+            regressor=estimator,
+            func=np.log1p,
+            inverse_func=np.expm1,
+            check_inverse=False,
+        )
+        # Every existing key needs the regressor__ prefix to route through the wrapper.
+        param_dist = {f"regressor__{k}": v for k, v in param_dist.items()}
 
     if sample_size is not None and sample_size < len(X):
-
         X = X.iloc[-sample_size:]
         y = y.iloc[-sample_size:]
 
@@ -427,11 +432,13 @@ def train_final_model(
         ParameterSampler(param_dist, n_iter=n_iter, random_state=random_state)
     )
 
+    metric_name = "rmsle" if log_target else "rmse"
     if verbose:
         print(
-            f"[train_final_model] model={model_name}  rows={len(X):,}  "
-            f"features={X.shape[1]}  n_iter={len(sampler)}  cv_splits={cv_splits}  "
-            f"total_fits={len(sampler) * cv_splits + 1} (incl. final refit)"
+            f"[train_final_model] model={model_name}  log_target={log_target}  "
+            f"rows={len(X):,}  features={X.shape[1]}  n_iter={len(sampler)}  "
+            f"cv_splits={cv_splits}  total_fits={len(sampler) * cv_splits + 1} "
+            f"(incl. final refit)  scoring={metric_name}"
         )
         print(f"[train_final_model] param grid keys: {sorted(param_dist)}\n")
 
@@ -439,35 +446,39 @@ def train_final_model(
     t_start = time.time()
     for i, params in enumerate(sampler, start=1):
         t_cfg = time.time()
-        fold_rmses = []
+        fold_scores = []
         for tr_idx, te_idx in cv.split(X):
             est = clone(estimator).set_params(**params)
             est.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-            # Poisson-trained models give non-negative preds; clip is defensive.
             y_pred = np.maximum(0, est.predict(X.iloc[te_idx]))
-            fold_rmses.append(
-                float(np.sqrt(mean_squared_error(y.iloc[te_idx], y_pred)))
-            )
-        mean_rmse = float(np.mean(fold_rmses))
-        std_rmse = float(np.std(fold_rmses))
+            if log_target:
+                fold_scores.append(
+                    float(np.sqrt(mean_squared_log_error(y.iloc[te_idx], y_pred)))
+                )
+            else:
+                fold_scores.append(
+                    float(np.sqrt(mean_squared_error(y.iloc[te_idx], y_pred)))
+                )
+        mean_score = float(np.mean(fold_scores))
+        std_score = float(np.std(fold_scores))
         rows.append({
             "iter": i,
-            "mean_rmse": mean_rmse,
-            "std_rmse": std_rmse,
+            f"mean_{metric_name}": mean_score,
+            f"std_{metric_name}": std_score,
             "params": params,
-            "fold_rmses": fold_rmses,
+            f"fold_{metric_name}s": fold_scores,
         })
         if verbose:
             print(
-                f"[{i:>3}/{len(sampler)}] mean_rmse={mean_rmse:.4f}  "
-                f"std={std_rmse:.4f}  folds={[f'{r:.3f}' for r in fold_rmses]}  "
+                f"[{i:>3}/{len(sampler)}] mean_{metric_name}={mean_score:.4f}  "
+                f"std={std_score:.4f}  folds={[f'{r:.3f}' for r in fold_scores]}  "
                 f"time={time.time() - t_cfg:.1f}s  params={params}",
                 flush=True,
             )
 
     results_df = (
         pd.DataFrame(rows)
-        .sort_values("mean_rmse")
+        .sort_values(f"mean_{metric_name}")
         .reset_index(drop=True)
     )
     best_row = results_df.iloc[0]
@@ -476,7 +487,8 @@ def train_final_model(
     if verbose:
         print(
             f"\n[train_final_model] search done in {time.time() - t_start:.1f}s. "
-            f"Best mean_rmse={best_row['mean_rmse']:.4f}  params={best_params}"
+            f"Best mean_{metric_name}={best_row[f'mean_{metric_name}']:.4f}  "
+            f"params={best_params}"
         )
         print("[train_final_model] refitting best config on full (X, y)...")
 
@@ -486,7 +498,7 @@ def train_final_model(
     search = SimpleNamespace(
         best_estimator_=best_estimator,
         best_params_=best_params,
-        best_score_=-best_row["mean_rmse"],  # sklearn convention: negative
+        best_score_=-best_row[f"mean_{metric_name}"],
         results_df=results_df,
     )
     return best_estimator, search
