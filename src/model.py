@@ -424,6 +424,8 @@ def train_final_model(
         param_dist = {f"regressor__{k}": v for k, v in param_dist.items()}
 
     if sample_size is not None and sample_size < len(X):
+        X_total = X 
+        y_total = y
         X = X.iloc[-sample_size:]
         y = y.iloc[-sample_size:]
 
@@ -493,7 +495,9 @@ def train_final_model(
         print("[train_final_model] refitting best config on full (X, y)...")
 
     best_estimator = clone(estimator).set_params(**best_params)
-    best_estimator.fit(X, y)
+    
+    # train the last estimator with the complete dataset
+    best_estimator.fit(X_total, y_total)
 
     search = SimpleNamespace(
         best_estimator_=best_estimator,
