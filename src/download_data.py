@@ -73,5 +73,57 @@ def download_raw_data(force: bool = False) -> tuple[str, str]:
     return target_paths["dataset_train.csv"], target_paths["dataset_test.csv"]
 
 
+def upload_to_colab() -> tuple[str, str]:
+    """
+    Upload local dataset_train.csv and dataset_test.csv into a Colab runtime.
+
+    Intended for sessions that connect to a Google Colab kernel (e.g. from
+    VSCode) without Kaggle credentials available. Opens the Colab file picker,
+    then writes the selected files into data/raw/ on the runtime under the
+    canonical names so downstream code can use the same relative paths.
+
+    The picker accepts both files at once; the train/test role is inferred
+    from a 'train'/'test' substring in each uploaded filename.
+
+    Returns:
+        (train_path, test_path) as strings, both pointing inside data/raw/.
+    """
+    try:
+        from google.colab import files  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "upload_to_colab() must be called from a Google Colab runtime."
+        ) from e
+
+    os.makedirs(RAW_DATA_DIR, exist_ok=True)
+
+    print(
+        "Select the two CSVs to upload: one whose name contains 'train' and "
+        "one whose name contains 'test'."
+    )
+    uploaded = files.upload()  # dict: filename -> bytes
+
+    target_paths: dict[str, str] = {}
+    for target_name, name_substring in FILES.items():
+        matches = [fn for fn in uploaded if name_substring.lower() in fn.lower()]
+        if not matches:
+            raise FileNotFoundError(
+                f"No uploaded file containing {name_substring!r}. "
+                f"Uploaded: {list(uploaded)}"
+            )
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Multiple uploaded files match {name_substring!r}: {matches}"
+            )
+        source_name = matches[0]
+        target = os.path.join(RAW_DATA_DIR, target_name)
+        with open(target, "wb") as f:
+            f.write(uploaded[source_name])
+        target_paths[target_name] = target
+        print(f"Saved {source_name} -> {target}")
+
+    return target_paths["dataset_train.csv"], target_paths["dataset_test.csv"]
+
+
 if __name__ == "__main__":
     download_raw_data()
