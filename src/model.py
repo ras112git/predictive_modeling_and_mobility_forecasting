@@ -363,34 +363,25 @@ def benchmark_models(
         .reset_index(drop=True)
     )
 
-def train_final_model(
-    X,
-    y,
-    model_name,
-    n_iter=40,
-    cv_splits=3,
-    random_state=42,
-    verbose=True,
-    sample_size=None,
-    log_target=False,
-):
-    """Run a manual randomized search with a wider grid on the chosen model.
+def _build_final_estimator(X, model_name, random_state=42, log_target=False):
+    """Build the (optionally log-transformed) estimator + its param grid.
 
-    When `log_target=True`, the estimator's loss is switched from Poisson
-    to squared error and the whole thing is wrapped in
-    TransformedTargetRegressor(func=log1p, inverse_func=expm1). CV scoring
-    also switches from RMSE to RMSLE so hyperparameters are picked on the
-    metric Kaggle scores you on.
+    Shared by `train_hyperparameters` and `train_final_model` so both
+    construct the estimator identically. That identity is what makes the
+    `regressor__`-prefixed `best_params` returned by the search applicable,
+    unchanged, in the final refit.
+
+    When `log_target=True`, the estimator's loss is switched from Poisson to
+    squared error and the whole thing is wrapped in
+    TransformedTargetRegressor(func=log1p, inverse_func=expm1).
+
+    Returns:
+        (estimator, param_dist) where `param_dist` already has the
+        `regressor__` prefix applied when `log_target=True`.
     """
-    import time
-    from types import SimpleNamespace
-
     import numpy as np
-    import pandas as pd
     from sklearn.base import clone
     from sklearn.compose import TransformedTargetRegressor
-    from sklearn.metrics import mean_squared_error, mean_squared_log_error
-    from sklearn.model_selection import ParameterSampler, TimeSeriesSplit
     from sklearn.pipeline import Pipeline
 
     estimator, _ = get_model_grid(Feature_df=X, random_state=random_state)[model_name]
@@ -408,7 +399,7 @@ def train_final_model(
         if model_name in loss_settings:
             pname, pval = loss_settings[model_name]
             # DT/RF come back as Pipeline([preprocess, model]) when station_number
-            # is present, so the param is reachable as "model__criterion", this comes 
+            # is present, so the param is reachable as "model__criterion", this comes
             # from the pipeline for decision trees and random forests
             if isinstance(estimator, Pipeline):
                 pname = f"model__{pname}"
@@ -423,9 +414,52 @@ def train_final_model(
         # Every existing key needs the regressor__ prefix to route through the wrapper.
         param_dist = {f"regressor__{k}": v for k, v in param_dist.items()}
 
+    return estimator, param_dist
+
+
+def train_hyperparameters(
+    X,
+    y,
+    model_name,
+    n_iter=40,
+    cv_splits=3,
+    random_state=42,
+    verbose=True,
+    sample_size=None,
+    log_target=False,
+):
+    """Manual randomized search with the wide grid; returns the best params.
+
+    Runs a TimeSeriesSplit CV for each sampled config and ranks them by RMSE
+    (or RMSLE when `log_target=True`, so hyperparameters are picked on the
+    metric Kaggle scores you on). Does NOT refit a final model — hand the
+    returned `best_params` to `train_final_model`.
+
+    Args:
+        sample_size: if set, the search uses only the last `sample_size` rows
+            (the most recent data) to speed up tuning. Independent of the
+            sample size used by `train_final_model` for the final fit.
+
+    Returns:
+        (best_params, search) where `best_params` is the winning param dict
+        (keys carry the `regressor__` prefix when `log_target=True`, ready to
+        pass straight to `train_final_model`), and `search` is a
+        SimpleNamespace with `best_params_`, `best_score_`, `results_df`.
+    """
+    import time
+    from types import SimpleNamespace
+
+    import numpy as np
+    import pandas as pd
+    from sklearn.base import clone
+    from sklearn.metrics import mean_squared_error, mean_squared_log_error
+    from sklearn.model_selection import ParameterSampler, TimeSeriesSplit
+
+    estimator, param_dist = _build_final_estimator(
+        X, model_name, random_state=random_state, log_target=log_target
+    )
+
     if sample_size is not None and sample_size < len(X):
-        X_total = X 
-        y_total = y
         X = X.iloc[-sample_size:]
         y = y.iloc[-sample_size:]
 
@@ -437,12 +471,12 @@ def train_final_model(
     metric_name = "rmsle" if log_target else "rmse"
     if verbose:
         print(
-            f"[train_final_model] model={model_name}  log_target={log_target}  "
+            f"[train_hyperparameters] model={model_name}  log_target={log_target}  "
             f"rows={len(X):,}  features={X.shape[1]}  n_iter={len(sampler)}  "
-            f"cv_splits={cv_splits}  total_fits={len(sampler) * cv_splits + 1} "
-            f"(incl. final refit)  scoring={metric_name}"
+            f"cv_splits={cv_splits}  total_fits={len(sampler) * cv_splits}  "
+            f"scoring={metric_name}"
         )
-        print(f"[train_final_model] param grid keys: {sorted(param_dist)}\n")
+        print(f"[train_hyperparameters] param grid keys: {sorted(param_dist)}\n")
 
     rows = []
     t_start = time.time()
@@ -488,24 +522,63 @@ def train_final_model(
 
     if verbose:
         print(
-            f"\n[train_final_model] search done in {time.time() - t_start:.1f}s. "
+            f"\n[train_hyperparameters] search done in {time.time() - t_start:.1f}s. "
             f"Best mean_{metric_name}={best_row[f'mean_{metric_name}']:.4f}  "
             f"params={best_params}"
         )
-        print("[train_final_model] refitting best config on full (X, y)...")
-
-    best_estimator = clone(estimator).set_params(**best_params)
-    
-    # train the last estimator with the complete dataset
-    best_estimator.fit(X_total, y_total)
 
     search = SimpleNamespace(
-        best_estimator_=best_estimator,
         best_params_=best_params,
         best_score_=-best_row[f"mean_{metric_name}"],
         results_df=results_df,
     )
-    return best_estimator, search
+    return best_params, search
+
+
+def train_final_model(
+    X,
+    y,
+    model_name,
+    best_params,
+    sample_size=None,
+    random_state=42,
+    log_target=False,
+    verbose=True,
+):
+    """Refit the chosen model with given hyperparameters on the data.
+
+    Args:
+        best_params: param dict from `train_hyperparameters`. Its keys must
+            carry the same prefixes used during tuning (e.g. `regressor__`
+            when `log_target=True`), and `log_target` here must match what was
+            passed to `train_hyperparameters` so the estimator is rebuilt the
+            same way.
+        sample_size: if set, fit on only the last `sample_size` rows (the most
+            recent data). Default None = use all of (X, y).
+
+    Returns:
+        The fitted estimator.
+    """
+    from sklearn.base import clone
+
+    estimator, _ = _build_final_estimator(
+        X, model_name, random_state=random_state, log_target=log_target
+    )
+
+    if sample_size is not None and sample_size < len(X):
+        X = X.iloc[-sample_size:]
+        y = y.iloc[-sample_size:]
+
+    if verbose:
+        print(
+            f"[train_final_model] refitting {model_name} on "
+            f"rows={len(X):,}, features={X.shape[1]}, log_target={log_target}..."
+        )
+        print(f"[train_final_model] params: {best_params}")
+
+    best_estimator = clone(estimator).set_params(**best_params)
+    best_estimator.fit(X, y)
+    return best_estimator
 
 def evaluate(model, X, y):
     """Return a dict {rmse, mae, rmsle} for predictions on (X, y)."""

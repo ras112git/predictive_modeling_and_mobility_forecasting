@@ -31,7 +31,9 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
     
     #Transform the datetime, needed for the submission file, the localize makes sure that the format is correct (rather than having the UCT reference)
     dataset['datetime'] = pd.to_datetime(dataset['datetime'], utc=True).dt.tz_localize(None)  
-
+    
+    # This is the old factor changing method
+    """
     # Boolean check, that it is true when hour, minute and second are all 0
     is_midnight = (dataset['datetime'].dt.hour == 0) & (dataset['datetime'].dt.minute == 0) & (dataset['datetime'].dt.second == 0)
     
@@ -41,6 +43,8 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
         dataset['datetime'].dt.strftime('%Y-%m-%d'),
         dataset['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
     )
+    """
+    datetime_str = dataset['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
     # The insert method takes (position_index, column_name, values)
     dataset.insert(0, 'id', datetime_str + "_" + dataset.iloc[:, 1].astype(str))
@@ -73,6 +77,11 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
     dataset['is_holiday'] = dataset['datetime'].dt.date.apply(lambda x: x in at_holidays)
     dataset['is_holiday'] = dataset['is_holiday'].astype(int)
 
+    # Average bikes per station (target-derived): on train this computes the
+    # per-station means and caches them; on test it reads that cache back.
+    # Done while station_number is still a plain int, before encoding below.
+    dataset = add_avg_bikes_per_station(dataset, is_train=is_train)
+
     # One-hot encode station_number. Using pd.Categorical with explicit
     # categories guarantees that train and test produce the same st_* columns
     # in the same order when the caller passes station_categories.
@@ -94,6 +103,89 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
 
 
     return dataset
+
+
+def add_avg_bikes_per_station(
+    df,
+    is_train: bool,
+    target="bikes",
+    cache_path="data/interim/station_means.csv",
+):
+    """Append the mean number of bikes per station as a feature column.
+
+    Some stations are consistently busier than others, so the per-station
+    average of the target is a strong signal. But because it is derived from
+    the target, it must be computed on the TRAIN data only and then reused
+    unchanged on the test set — otherwise it leaks target information.
+
+    Train and test are cleaned in separate notebook runs (03 vs 04), so the
+    means are persisted to `cache_path`, the same train/test contract that
+    `add_weather_features` uses for its weather cache: on the train pass the
+    means are computed from `df` and written out; on the test pass they are
+    read back and mapped onto the rows by `station_number`.
+
+    Args:
+        df: cleaned DataFrame with a `station_number` column. On the train
+            pass it must also contain `target`.
+        is_train: True computes the means from `df` and writes them to
+            `cache_path`. False reads the means from `cache_path` and maps
+            them on (no target column needed).
+        target: name of the target column. Default `'bikes'`.
+        cache_path: CSV path for the persisted per-station means. Pass None to
+            skip persistence (only meaningful on the train pass, e.g. for an
+            in-memory experiment).
+
+    Returns:
+        Copy of `df` with a new `avg_bikes_per_station` column. Stations not
+        present in the means (e.g. a test station unseen in train) fall back
+        to the global mean of the train means.
+
+    Side effects:
+        Writes the per-station means to `cache_path` on the train pass.
+
+    Raises:
+        KeyError: if `station_number` is missing, or `target` is missing on
+            the train pass.
+        FileNotFoundError: on the test pass if `cache_path` does not exist
+            (clean the train set first to create it).
+    """
+    from pathlib import Path
+
+    if "station_number" not in df.columns:
+        raise KeyError(
+            "df must have a 'station_number' column before averaging bikes "
+            "per station."
+        )
+
+    df = df.copy()
+    cache_path = Path(cache_path) if cache_path else None
+
+    if is_train:
+        if target not in df.columns:
+            raise KeyError(
+                f"target column '{target}' not found; computing the per-station "
+                "means requires the training data."
+            )
+        station_means = df.groupby("station_number", observed=True)[target].mean()
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            station_means.rename("avg_bikes_per_station").to_csv(cache_path)
+    else:
+        if cache_path is None or not cache_path.exists():
+            raise FileNotFoundError(
+                f"station means cache not found at {cache_path}. Clean the "
+                "train set first (is_train=True) to create it."
+            )
+        cached = pd.read_csv(cache_path)
+        station_means = cached.set_index("station_number")["avg_bikes_per_station"]
+
+    # Global mean is the fallback for stations missing from the means mapping.
+    global_mean = float(station_means.mean())
+    df["avg_bikes_per_station"] = (
+        df["station_number"].map(station_means).fillna(global_mean)
+    )
+
+    return df
 
 
 def add_weather_features(
@@ -191,4 +283,3 @@ def add_weather_features(
     )
     df = df.drop(columns="_join_hour")
     return df
-
