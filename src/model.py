@@ -4,14 +4,18 @@ def data_split(df, target):
     y = df[target]
     return X, y
 
-def prepare_features(X, drop_cols):
-    """Drop identifier columns and cast station_number to pandas `category`.
+_REDUNDANT_FEATURES = ['minute', 'is_weekend', 'hour_sin', 'hour_cos', 'snowfall']
 
-    The categorical dtype is what LightGBM, XGBoost (with enable_categorical)
-    and HistGradientBoosting auto-detect as a categorical feature, so the
-    modeling code doesn't need a separate `categorical_feature` argument.
+
+def prepare_features(X, drop_cols):
+    """Drop identifier and redundant columns; cast station_number to category.
+
+    In addition to drop_cols, always removes: minute, is_weekend, hour_sin,
+    hour_cos, snowfall — these consistently show near-zero importance and
+    either duplicate other features or carry no signal.
     """
-    X = X.drop(columns=drop_cols)
+    all_drop = [c for c in drop_cols + _REDUNDANT_FEATURES if c in X.columns]
+    X = X.drop(columns=all_drop)
     if 'station_number' in X.columns:
         X = X.assign(station_number=X['station_number'].astype('category'))
     return X
@@ -29,13 +33,10 @@ def feature_selection_report(X, y, sample_size=100_000, random_state=42):
 
     has_station = 'station_number' in X.columns
 
+    discrete_cols = {'dayofweek', 'month', 'is_holiday', 'hour'}
     if has_station:
-        discrete_cols = {'station_number','minute', 'dayofweek', 
-                    'month', 'is_weekend', 'is_holiday', 'hour'}
-    else:
-        discrete_cols = {'minute', 'dayofweek', 
-            'month', 'is_weekend', 'is_holiday', 'hour'} 
-    
+        discrete_cols.add('station_number')
+
     discrete_mask = [col in discrete_cols or col.startswith('st_') for col in X_sample.columns]
 
     mi = mutual_info_regression(

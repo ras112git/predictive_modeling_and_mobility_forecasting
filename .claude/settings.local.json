@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python)"
+      "Bash(python)",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('notebooks/01_exploration.ipynb'\\)\\); cells=nb['cells']; [print\\(f'=== CELL {i} ==='\\); [print\\(o.get\\('text',''\\)\\) for o in c.get\\('outputs',[]\\)] for i,c in enumerate\\(cells\\) if i in [22,24,26]]\")",
+      "Bash(python -c ' *)"
     ]
   }
 }

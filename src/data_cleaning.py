@@ -96,6 +96,59 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
     return dataset
 
 
+def add_lag_features(df):
+    """Add per-station lag and rolling features for bike availability.
+
+    Must be called on a dataset that already has 'bikes', 'station_number',
+    'datetime', and 'hour' columns (i.e. after clean_data()).
+
+    Lag steps assume 30-minute intervals:
+        1  step  =  30 min
+        2  steps =  1 hour
+        4  steps =  2 hours
+        48 steps = 24 hours
+       336 steps =  1 week
+
+    Also adds a station×hour historical mean and a 3-hour rolling mean/std.
+    Rows where any lag is NaN (start of each station's history) are dropped.
+    """
+    df = df.copy()
+    df = df.sort_values(['station_number', 'datetime']).reset_index(drop=True)
+
+    grp = df.groupby('station_number', observed=True)['bikes']
+
+    df['bikes_lag_1']   = grp.shift(1)
+    df['bikes_lag_2']   = grp.shift(2)
+    df['bikes_lag_4']   = grp.shift(4)
+    df['bikes_lag_48']  = grp.shift(48)
+    df['bikes_lag_336'] = grp.shift(336)
+
+    df['bikes_roll3h_mean'] = grp.transform(
+        lambda x: x.shift(1).rolling(6, min_periods=1).mean()
+    )
+    df['bikes_roll3h_std'] = grp.transform(
+        lambda x: x.shift(1).rolling(6, min_periods=2).std().fillna(0)
+    )
+
+    station_hour_mean = (
+        df.groupby(['station_number', 'hour'], observed=True)['bikes']
+        .mean()
+        .rename('station_hour_mean')
+        .reset_index()
+    )
+    df = df.merge(station_hour_mean, on=['station_number', 'hour'], how='left')
+
+    lag_cols = ['bikes_lag_1', 'bikes_lag_2', 'bikes_lag_4', 'bikes_lag_48', 'bikes_lag_336']
+    df = df.dropna(subset=lag_cols)
+
+    # Re-sort by datetime so callers see chronological order (TimeSeriesSplit,
+    # is_monotonic_increasing checks). The earlier sort by [station, datetime]
+    # was needed only for correct per-station lag computation.
+    df = df.sort_values('datetime').reset_index(drop=True)
+
+    return df
+
+
 def add_weather_features(
     df,
     lat: float = 48.21,
