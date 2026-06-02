@@ -250,6 +250,97 @@ def get_final_param_grid(Feature_df, model_name):
     return grid
 
 
+def get_bayes_search_space(Feature_df, model_name):
+    """Return continuous/integer search-space specs for Bayesian optimization.
+
+    The Optuna counterpart of `get_final_param_grid`: instead of discrete value
+    lists it returns, per hyperparameter, a distribution spec that
+    `train_hyperparameters` feeds to `optuna.Trial.suggest_*`. Encoding:
+
+        ("int",   low, high)            -> trial.suggest_int(name, low, high)
+        ("int",   low, high, "log")     -> trial.suggest_int(..., log=True)
+        ("float", low, high)            -> trial.suggest_float(name, low, high)
+        ("float", low, high, "log")     -> trial.suggest_float(..., log=True)
+        ("cat",   [values])             -> trial.suggest_categorical(name, values)
+
+    Ranges are roughly the convex hull of the discrete grids in
+    `get_final_param_grid`, so Bayesian search can exploit continuity rather
+    than hopping between a handful of fixed points.
+
+    Args:
+        Feature_df: the feature frame — only inspected for `station_number`,
+            which decides whether the pipeline `model__` prefix is applied
+            (mirrors `get_final_param_grid`).
+        model_name: key from `get_model_grid()`.
+
+    Returns:
+        Dict {param_name: spec_tuple} suitable for `train_hyperparameters`.
+
+    Raises:
+        KeyError: if `model_name` is not one of the known models.
+    """
+    spaces = {
+        "Featureless": {
+            "strategy": ("cat", ["mean", "median"]),
+        },
+        "decision_tree": {
+            "max_depth":         ("int",   4, 32),
+            "min_samples_leaf":  ("int",   1, 100, "log"),
+            "min_samples_split": ("int",   2, 20),
+            "max_features":      ("float", 0.3, 1.0),
+        },
+        "random_forest": {
+            "n_estimators":      ("int",   200, 600),
+            "max_depth":         ("int",   8, 32),
+            "min_samples_leaf":  ("int",   1, 10),
+            "min_samples_split": ("int",   2, 10),
+            "max_features":      ("float", 0.3, 0.8),
+        },
+        "hist_gbm": {
+            "max_iter":          ("int",   200, 1200),
+            "learning_rate":     ("float", 0.01, 0.2, "log"),
+            "max_depth":         ("int",   4, 16),
+            "min_samples_leaf":  ("int",   10, 100),
+            "max_leaf_nodes":    ("int",   15, 255),
+            "l2_regularization": ("float", 1e-3, 10.0, "log"),
+        },
+        "xgboost": {
+            "n_estimators":      ("int",   200, 1200),
+            "learning_rate":     ("float", 0.005, 0.2, "log"),
+            "max_depth":         ("int",   4, 12),
+            "min_child_weight":  ("int",   1, 20),
+            "subsample":         ("float", 0.6, 1.0),
+            "colsample_bytree":  ("float", 0.6, 1.0),
+            "reg_alpha":         ("float", 1e-3, 1.0, "log"),
+            "reg_lambda":        ("float", 1e-2, 10.0, "log"),
+            "gamma":             ("float", 1e-3, 1.0, "log"),
+        },
+        "lightgbm": {
+            "n_estimators":      ("int",   200, 1200),
+            "learning_rate":     ("float", 0.005, 0.2, "log"),
+            "num_leaves":        ("int",   16, 512),
+            "max_depth":         ("int",   4, 14),
+            "min_child_samples": ("int",   5, 100),
+            "subsample":         ("float", 0.6, 1.0),
+            "colsample_bytree":  ("float", 0.6, 1.0),
+            "reg_alpha":         ("float", 1e-3, 1.0, "log"),
+            "reg_lambda":        ("float", 1e-2, 10.0, "log"),
+        },
+    }
+    if model_name not in spaces:
+        raise KeyError(
+            f"Unknown model '{model_name}'. Expected one of {list(spaces)}."
+        )
+
+    space = spaces[model_name]
+
+    # Pipeline-wrapped models need the model__ prefix (same rule as the grid).
+    has_station = 'station_number' in Feature_df.columns
+    if has_station and model_name in {"decision_tree", "random_forest"}:
+        space = {f"model__{k}": v for k, v in space.items()}
+    return space
+
+
 def benchmark_models(
     X,
     y,
@@ -428,14 +519,18 @@ def train_hyperparameters(
     sample_size=None,
     log_target=False,
 ):
-    """Manual randomized search with the wide grid; returns the best params.
+    """Bayesian (Optuna/TPE) hyperparameter search; returns the best params.
 
-    Runs a TimeSeriesSplit CV for each sampled config and ranks them by RMSE
-    (or RMSLE when `log_target=True`, so hyperparameters are picked on the
-    metric Kaggle scores you on). Does NOT refit a final model — hand the
-    returned `best_params` to `train_final_model`.
+    Runs a TimeSeriesSplit CV for each Optuna trial and minimizes RMSE (or
+    RMSLE when `log_target=True`, so hyperparameters are picked on the metric
+    Kaggle scores you on). Unlike a random sweep, each trial is chosen from the
+    results of earlier ones, over the continuous/integer ranges defined in
+    `get_bayes_search_space`. Does NOT refit a final model — hand the returned
+    `best_params` to `train_final_model`.
 
     Args:
+        n_iter: number of Optuna trials (kept as `n_iter` for call-site
+            compatibility with the previous random search).
         sample_size: if set, the search uses only the last `sample_size` rows
             (the most recent data) to speed up tuning. Independent of the
             sample size used by `train_final_model` for the final fit.
@@ -450,38 +545,54 @@ def train_hyperparameters(
     from types import SimpleNamespace
 
     import numpy as np
+    import optuna
     import pandas as pd
     from sklearn.base import clone
     from sklearn.metrics import mean_squared_error, mean_squared_log_error
-    from sklearn.model_selection import ParameterSampler, TimeSeriesSplit
+    from sklearn.model_selection import TimeSeriesSplit
 
-    estimator, param_dist = _build_final_estimator(
+    # Reuse the shared builder so the estimator is constructed identically to
+    # train_final_model (loss-switch + TransformedTargetRegressor under
+    # log_target). Its param_dist is the random-search grid — not needed here.
+    estimator, _ = _build_final_estimator(
         X, model_name, random_state=random_state, log_target=log_target
     )
+
+    space = get_bayes_search_space(X, model_name)
+    if log_target:
+        # Route every param through the TransformedTargetRegressor wrapper.
+        space = {f"regressor__{k}": v for k, v in space.items()}
 
     if sample_size is not None and sample_size < len(X):
         X = X.iloc[-sample_size:]
         y = y.iloc[-sample_size:]
 
     cv = TimeSeriesSplit(n_splits=cv_splits)
-    sampler = list(
-        ParameterSampler(param_dist, n_iter=n_iter, random_state=random_state)
-    )
-
     metric_name = "rmsle" if log_target else "rmse"
+
+    def _suggest(trial, name, spec):
+        kind = spec[0]
+        if kind == "cat":
+            return trial.suggest_categorical(name, spec[1])
+        low, high = spec[1], spec[2]
+        log = len(spec) > 3 and spec[3] == "log"
+        if kind == "int":
+            return trial.suggest_int(name, low, high, log=log)
+        if kind == "float":
+            return trial.suggest_float(name, low, high, log=log)
+        raise ValueError(f"Unknown spec kind '{kind}' for param '{name}'.")
+
     if verbose:
         print(
             f"[train_hyperparameters] model={model_name}  log_target={log_target}  "
-            f"rows={len(X):,}  features={X.shape[1]}  n_iter={len(sampler)}  "
-            f"cv_splits={cv_splits}  total_fits={len(sampler) * cv_splits}  "
-            f"scoring={metric_name}"
+            f"rows={len(X):,}  features={X.shape[1]}  n_iter={n_iter}  "
+            f"cv_splits={cv_splits}  total_fits={n_iter * cv_splits}  "
+            f"sampler=TPE  scoring={metric_name}"
         )
-        print(f"[train_hyperparameters] param grid keys: {sorted(param_dist)}\n")
+        print(f"[train_hyperparameters] search space keys: {sorted(space)}\n")
 
-    rows = []
-    t_start = time.time()
-    for i, params in enumerate(sampler, start=1):
-        t_cfg = time.time()
+    def objective(trial):
+        params = {name: _suggest(trial, name, spec) for name, spec in space.items()}
         fold_scores = []
         for tr_idx, te_idx in cv.split(X):
             est = clone(estimator).set_params(**params)
@@ -495,41 +606,54 @@ def train_hyperparameters(
                 fold_scores.append(
                     float(np.sqrt(mean_squared_error(y.iloc[te_idx], y_pred)))
                 )
-        mean_score = float(np.mean(fold_scores))
-        std_score = float(np.std(fold_scores))
-        rows.append({
-            "iter": i,
-            f"mean_{metric_name}": mean_score,
-            f"std_{metric_name}": std_score,
-            "params": params,
-            f"fold_{metric_name}s": fold_scores,
-        })
-        if verbose:
-            print(
-                f"[{i:>3}/{len(sampler)}] mean_{metric_name}={mean_score:.4f}  "
-                f"std={std_score:.4f}  folds={[f'{r:.3f}' for r in fold_scores]}  "
-                f"time={time.time() - t_cfg:.1f}s  params={params}",
-                flush=True,
-            )
+        trial.set_user_attr("fold_scores", fold_scores)
+        return float(np.mean(fold_scores))
 
+    def _progress(study, trial):
+        if not verbose:
+            return
+        fold_scores = trial.user_attrs.get("fold_scores", [])
+        print(
+            f"[{trial.number + 1:>3}/{n_iter}] mean_{metric_name}={trial.value:.4f}  "
+            f"std={float(np.std(fold_scores)):.4f}  "
+            f"folds={[f'{r:.3f}' for r in fold_scores]}  "
+            f"best={study.best_value:.4f}  params={trial.params}",
+            flush=True,
+        )
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    sampler = optuna.samplers.TPESampler(seed=random_state)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+
+    t_start = time.time()
+    study.optimize(objective, n_trials=n_iter, callbacks=[_progress])
+
+    rows = [
+        {
+            "iter": t.number + 1,
+            f"mean_{metric_name}": t.value,
+            f"std_{metric_name}": float(np.std(t.user_attrs.get("fold_scores", [0.0]))),
+            "params": t.params,
+            f"fold_{metric_name}s": t.user_attrs.get("fold_scores", []),
+        }
+        for t in study.trials
+    ]
     results_df = (
         pd.DataFrame(rows)
         .sort_values(f"mean_{metric_name}")
         .reset_index(drop=True)
     )
-    best_row = results_df.iloc[0]
-    best_params = best_row["params"]
+    best_params = study.best_params
 
     if verbose:
         print(
             f"\n[train_hyperparameters] search done in {time.time() - t_start:.1f}s. "
-            f"Best mean_{metric_name}={best_row[f'mean_{metric_name}']:.4f}  "
-            f"params={best_params}"
+            f"Best mean_{metric_name}={study.best_value:.4f}  params={best_params}"
         )
 
     search = SimpleNamespace(
         best_params_=best_params,
-        best_score_=-best_row[f"mean_{metric_name}"],
+        best_score_=-study.best_value,
         results_df=results_df,
     )
     return best_params, search

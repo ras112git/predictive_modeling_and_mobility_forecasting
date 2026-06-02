@@ -7,3 +7,4 @@ holidays
 joblib
 xgboost
 lightgbm
+optuna
