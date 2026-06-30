@@ -710,11 +710,10 @@ def evaluate(model, X, y):
     from sklearn.metrics import mean_absolute_error, mean_squared_error,mean_squared_log_error
     import numpy as np
 
-    y_pred = model.predict(X)
+    # Poisson/log-target models can emit tiny negatives; clip so the metrics
+    # (RMSLE in particular) match what the rounded, non-negative submission scores.
+    y_pred = np.maximum(0, model.predict(X))
 
-    print(y_pred)
-
-    # Evaluate
     mae = mean_absolute_error(y, y_pred)
     rmse = np.sqrt(mean_squared_error(y, y_pred))
     rmsle = np.sqrt(mean_squared_log_error(y, y_pred))
@@ -722,10 +721,16 @@ def evaluate(model, X, y):
     print(f"RMSE:  {rmse:.3f}")
     print(f"RMSLE: {rmsle:.3f}")
 
-    return None
+    return {"mae": mae, "rmse": rmse, "rmsle": rmsle}
 
 def save_model(model, path):
     """joblib.dump wrapper that creates parent directories."""
+    import os
+    import joblib
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    joblib.dump(model, path)
+    return path
 
 def plot_benchmark(df, metric="rmse_per_fold", figsize=(8, 5), title=None):
     """Box plot of per-fold scores from benchmark_models output.

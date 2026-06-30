@@ -65,9 +65,19 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
     dataset['month'] = dataset['datetime'].dt.month
     dataset['is_weekend'] = dataset['dayofweek'].isin([5, 6]).astype(int)
 
+    # 30-minute slot of the day (0..47). This is the natural granularity of the
+    # data (rows are :00 / :30) and the key that the station time-profiles below
+    # are built on, so a single integer captures "which half-hour of the day".
+    dataset['timeslot'] = dataset['hour'] * 2 + (dataset['minute'] // 30)
+
     # For cyclical data I can help the model differenciate between simple ordered rankings and actual circular data. In this case I do it with the hour (so it does not jump from 23 to 0 directly)
     dataset['hour_sin'] = np.sin(2 * np.pi * dataset['hour'] / 24)
     dataset['hour_cos'] = np.cos(2 * np.pi * dataset['hour'] / 24)
+
+    # Same cyclical trick for the weekly rhythm, so Sunday (6) sits next to
+    # Monday (0) instead of being 6 ordinal steps away.
+    dataset['dow_sin'] = np.sin(2 * np.pi * dataset['dayofweek'] / 7)
+    dataset['dow_cos'] = np.cos(2 * np.pi * dataset['dayofweek'] / 7)
 
     # Create Austria holidays object
     at_holidays = holidays.Austria(subdiv='9') #subdiv = 9 locates the specific holidays of viena
@@ -81,6 +91,13 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
     # per-station means and caches them; on test it reads that cache back.
     # Done while station_number is still a plain int, before encoding below.
     dataset = add_avg_bikes_per_station(dataset, is_train=is_train)
+
+    # Station time-profiles (target-derived, same train->cache->test contract):
+    # the historical mean bikes per station broken down by half-hour-of-day and
+    # day-of-week. This is the strong recurring signal the team flagged as "not
+    # yet implemented" — a single per-station mean cannot express that a station
+    # is full at 03:00 and empty at 08:00. Built before station encoding.
+    dataset = add_target_profile_features(dataset, is_train=is_train)
 
     # One-hot encode station_number. Using pd.Categorical with explicit
     # categories guarantees that train and test produce the same st_* columns
@@ -184,6 +201,122 @@ def add_avg_bikes_per_station(
     df["avg_bikes_per_station"] = (
         df["station_number"].map(station_means).fillna(global_mean)
     )
+
+    return df
+
+
+def add_target_profile_features(
+    df,
+    is_train: bool,
+    target="bikes",
+    cache_dir="data/interim",
+):
+    """Append historical mean-target *profiles* per station / time grouping.
+
+    Bike availability follows a strong, repeating daily and weekly rhythm: a
+    given station tends to hold a similar number of bikes at, say, 08:00 on a
+    Tuesday week after week. ``add_avg_bikes_per_station`` collapses that whole
+    rhythm into one number; these profiles keep its shape, which is by far the
+    most predictive signal for this forecast and the one the team's notes
+    flagged as "not yet implemented ... quite important".
+
+    For each grouping the mean target is computed on the TRAIN data only,
+    cached, and mapped back onto the rows by the group keys — the same
+    leak-free train->cache->test contract used by ``add_avg_bikes_per_station``
+    and ``add_weather_features``:
+
+        ``tprof_station_slot``      station_number x timeslot              (daily shape)
+        ``tprof_station_dow_slot``  station_number x dayofweek x timeslot  (full weekly shape)
+        ``tprof_station_dow``       station_number x dayofweek             (weekday level)
+
+    where ``timeslot = hour*2 + minute//30`` (the 30-min bin of the day, 0..47).
+
+    Missing combinations on the test pass (e.g. a station/slot never seen in
+    train) back off hierarchically: the finest profile falls back to the
+    coarser ones, then to ``avg_bikes_per_station``, then to the global train
+    mean — so the columns are dense and trees never split on a NaN sentinel.
+
+    Args:
+        df: cleaned DataFrame containing ``station_number``, ``timeslot`` and
+            ``dayofweek`` (and ``target`` on the train pass).
+        is_train: True computes the profiles from ``df`` and writes them to
+            ``cache_dir``. False reads them back and maps them on.
+        target: name of the target column. Default ``'bikes'``.
+        cache_dir: directory for the persisted per-group means. One CSV per
+            profile is written/read there.
+
+    Returns:
+        Copy of ``df`` with one new column per profile.
+
+    Raises:
+        KeyError: if a required key column (or ``target`` on train) is missing.
+        FileNotFoundError: on the test pass if a profile cache is absent
+            (clean the train set first to create it).
+    """
+    from pathlib import Path
+
+    groupings = {
+        "tprof_station_slot":     ["station_number", "timeslot"],
+        "tprof_station_dow_slot": ["station_number", "dayofweek", "timeslot"],
+        "tprof_station_dow":      ["station_number", "dayofweek"],
+    }
+
+    required = {"station_number", "timeslot", "dayofweek"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(
+            f"df is missing columns needed for the time-profiles: {sorted(missing)}. "
+            "Run clean_data() up to the datetime-feature step first."
+        )
+
+    df = df.copy()
+    cache_dir = Path(cache_dir)
+
+    for col, keys in groupings.items():
+        cache_path = cache_dir / f"{col}.csv"
+        if is_train:
+            if target not in df.columns:
+                raise KeyError(
+                    f"target column '{target}' is required to build profile '{col}'."
+                )
+            means = (
+                df.groupby(keys, observed=True)[target]
+                .mean()
+                .rename(col)
+                .reset_index()
+            )
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            means.to_csv(cache_path, index=False)
+        else:
+            if not cache_path.exists():
+                raise FileNotFoundError(
+                    f"profile cache not found at {cache_path}. Clean the train "
+                    "set first (is_train=True) to create it."
+                )
+            means = pd.read_csv(cache_path)
+        # how='left' preserves the row order of df (same as the weather merge),
+        # which the modeling notebook relies on for its monotonic-datetime check.
+        df = df.merge(means, on=keys, how="left")
+
+    # Hierarchical fallback for unseen combinations: finest -> coarser profiles
+    # -> per-station mean -> global mean. Keeps every profile column dense.
+    if "avg_bikes_per_station" in df.columns:
+        station_fallback = df["avg_bikes_per_station"]
+    else:
+        station_fallback = None
+
+    profile_cols = list(groupings)
+    global_mean = float(np.nanmean(df[profile_cols].to_numpy(dtype="float64")))
+
+    df["tprof_station_dow_slot"] = (
+        df["tprof_station_dow_slot"]
+        .fillna(df["tprof_station_slot"])
+        .fillna(df["tprof_station_dow"])
+    )
+    for col in profile_cols:
+        if station_fallback is not None:
+            df[col] = df[col].fillna(station_fallback)
+        df[col] = df[col].fillna(global_mean)
 
     return df
 
