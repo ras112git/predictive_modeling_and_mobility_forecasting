@@ -753,4 +753,3 @@ def plot_benchmark(df, metric="rmse_per_fold", figsize=(8, 5), title=None):
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
     return fig, ax
-
