@@ -1,0 +1,456 @@
+From 62deb0b774aa8ceaa907be23d52044d3838470aa Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 1 Jul 2026 19:24:09 +0000
+Subject: [PATCH] Add leakage-free holdout validation and recency weighting for
+ the train->test shift
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The station time-profiles alone did not move the leaderboard because the model
+could already recover them from the raw features, and — more importantly —
+because the real bottleneck is the winter->spring distribution shift between the
+training window (Sep–Mar) and the test window (Mar–Apr), which trees cannot
+extrapolate and which the target-mean features are biased against.
+
+Two changes to attack this, plus the honest metric needed to tune them:
+
+- src/model.py `time_holdout_validation`: an honest, leakage-free forecast
+  validation. It holds out the last weeks of TRAIN as a pseudo-test and rebuilds
+  the target-derived features (avg_bikes_per_station, tprof_*) from the earlier
+  part only — the same shape as the real train->test gap — so it tracks the
+  leaderboard, unlike the optimistic nested-CV whose features leak the target.
+
+- src/model.py `recency_weights` + `sample_weight` in `train_final_model`:
+  exponential-decay weights so recent rows count more, nudging the model's level
+  toward the (higher) spring test period and reducing the under-prediction RMSLE
+  punishes.
+
+- src/data_cleaning.py: thread a `cache_dir` through clean_data /
+  add_avg_bikes_per_station / add_target_profile_features so the validation can
+  rebuild the target caches in a scratch dir without clobbering data/interim.
+  The weather cache is exogenous (no leakage) and keeps its default location.
+
+- notebooks/03_modeling.ipynb: stash the timestamps before they are dropped,
+  add a RECENCY_HALFLIFE knob on the final fit, and add a cell that reports the
+  honest holdout RMSLE across half-lives so the team can pick what actually
+  helps before submitting.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D1HP5yAcJAwu38qPpwHPgi
+---
+ notebooks/03_modeling.ipynb |  72 +++++++++++---
+ src/data_cleaning.py        |  19 +++-
+ src/model.py                | 189 +++++++++++++++++++++++++++++++++++-
+ 3 files changed, 258 insertions(+), 22 deletions(-)
+
+diff --git a/notebooks/03_modeling.ipynb b/notebooks/03_modeling.ipynb
+index 5b06e71..b0a0311 100644
+--- a/notebooks/03_modeling.ipynb
++++ b/notebooks/03_modeling.ipynb
+@@ -2004,7 +2004,7 @@
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 5,
++   "execution_count": null,
+    "id": "244bd73d",
+    "metadata": {},
+    "outputs": [],
+@@ -2012,9 +2012,13 @@
+     "#Make sure that the data is ordered by datetime\n",
+     "assert x_train['datetime'].is_monotonic_increasing\n",
+     "\n",
++    "# Stash the timestamps BEFORE dropping them, so we can build recency weights\n",
++    "# for the final fit (prepare_features drops 'datetime').\n",
++    "train_datetimes = x_train['datetime'].copy()\n",
++    "\n",
+     "DROP_COLS = [\"id\", \"datetime\", \"name\"] #\n",
+     "\n",
+-    "x_train = prepare_features(X = x_train, drop_cols=DROP_COLS)"
++    "x_train = prepare_features(X = x_train, drop_cols=DROP_COLS)\n"
+    ]
+   },
+   {
+@@ -3682,26 +3686,27 @@
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 11,
++   "execution_count": null,
+    "id": "d154a725",
+    "metadata": {},
+-   "outputs": [
+-    {
+-     "name": "stdout",
+-     "output_type": "stream",
+-     "text": [
+-      "[train_final_model] refitting lightgbm on rows=2,150,250, features=19, log_target=True...\n",
+-      "[train_final_model] params: {'regressor__n_estimators': 383, 'regressor__learning_rate': 0.005089947160955213, 'regressor__num_leaves': 436, 'regressor__max_depth': 6, 'regressor__min_child_samples': 86, 'regressor__subsample': 0.9371312813667119, 'regressor__colsample_bytree': 0.7669699924693705, 'regressor__reg_alpha': 0.011769515602040172, 'regressor__reg_lambda': 0.2765832037009877}\n"
+-     ]
+-    }
+-   ],
++   "outputs": [],
+    "source": [
+     "# best_params = {'regressor__subsample': 0.8, 'regressor__reg_lambda': 0.1, 'regressor__reg_alpha': 0, 'regressor__num_leaves': 127, 'regressor__n_estimators': 200, 'regressor__min_child_samples': 100, 'regressor__max_depth': 8, 'regressor__learning_rate': 0.01, 'regressor__colsample_bytree': 0.7}\n",
+     "\n",
++    "# Recency weighting counters the winter->spring level shift between train and\n",
++    "# test: recent rows count more, nudging the level toward the test period.\n",
++    "# Pick RECENCY_HALFLIFE with the honest holdout metric below (None = off).\n",
++    "from src.model import recency_weights\n",
++    "RECENCY_HALFLIFE = 30   # days; try None / 45 / 30 / 21 and compare the holdout RMSLE\n",
++    "\n",
++    "sample_weight = (None if RECENCY_HALFLIFE is None\n",
++    "                 else recency_weights(train_datetimes, RECENCY_HALFLIFE))\n",
++    "\n",
+     "model = train_final_model(\n",
+     "    X=x_train, y=y_train, model_name=model_name,\n",
+-    "    best_params=best_params, log_target=True,   # optionally sample_size=...\n",
+-    ")"
++    "    best_params=best_params, log_target=True,\n",
++    "    sample_weight=sample_weight,   # optionally sample_size=...\n",
++    ")\n"
+    ]
+   },
+   {
+@@ -3883,6 +3888,43 @@
+     "evaluate(X = x_train,y = y_train,model=model)"
+    ]
+   },
++  {
++   "cell_type": "markdown",
++   "id": "6648b8f1",
++   "metadata": {},
++   "source": [
++    "### Honest, leakage-free holdout validation\n",
++    "\n",
++    "The benchmark / nested-CV RMSLE is optimistic: the target-derived features\n",
++    "(`avg_bikes_per_station`, `tprof_*`) are built on the whole training frame\n",
++    "*before* the folds are cut, so each validation row already \"knows\" its own\n",
++    "target. `time_holdout_validation` instead holds out the last weeks of TRAIN as\n",
++    "a pseudo-test and rebuilds those features from the earlier part only — the same\n",
++    "shape as the real train→test gap — so it tracks the leaderboard. Use it to pick\n",
++    "`RECENCY_HALFLIFE` (and to check any feature/param change) before submitting."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "id": "a7d90df1",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "from src.model import time_holdout_validation\n",
++    "import pandas as pd\n",
++    "\n",
++    "df_raw = pd.read_csv('data/raw/dataset_train.csv')\n",
++    "\n",
++    "for hl in [None, 45, 30, 21]:\n",
++    "    res = time_holdout_validation(\n",
++    "        df_raw, model_name=model_name, best_params=best_params,\n",
++    "        holdout_weeks=7, log_target=True, recency_halflife_days=hl, verbose=False,\n",
++    "    )\n",
++    "    print(f'recency_halflife={hl}: RMSLE={res[\"rmsle\"]:.4f}  '\n",
++    "          f'RMSE={res[\"rmse\"]:.3f}  MAE={res[\"mae\"]:.3f}')\n"
++   ]
++  },
+   {
+    "cell_type": "code",
+    "execution_count": 12,
+diff --git a/src/data_cleaning.py b/src/data_cleaning.py
+index dd15c90..1c44a7f 100644
+--- a/src/data_cleaning.py
++++ b/src/data_cleaning.py
+@@ -5,7 +5,8 @@ import holidays
+ 
+ 
+ 
+-def clean_data(dataset, is_train: bool, categorize_station = True, station_categories=None):
++def clean_data(dataset, is_train: bool, categorize_station = True, station_categories=None,
++               cache_dir="data/interim"):
+     """
+     Does the dataset cleaning that it was specified in the cleaning.ipynb
+ 
+@@ -13,15 +14,20 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
+     dataset: Which dataset wants to be cleaned
+     is_train: True for training data (drops NA + duplicates), False for test
+         (preserves rows for submission).
+-    categorize_station: True implies that the stations should be treated as categories, 
++    categorize_station: True implies that the stations should be treated as categories,
+         false, the categories are splited in hot boolean columns (station_categories), it was seen
+-        that it does not make a difference, so there is now just a pipeline in the benchmark grid 
++        that it does not make a difference, so there is now just a pipeline in the benchmark grid
+     station_categories: optional list of station numbers to use as one-hot
+         categories. When cleaning the train set, leave as None — the unique
+         stations in the data will be used. When cleaning the test set, pass
+         the train-set station list so train and test share the same `st_*`
+         columns in the same order. Stations in test but not in this list
+         produce all-zero rows across the station columns.
++    cache_dir: directory for the TARGET-derived caches (per-station means and
++        the time-profiles). Point it at a scratch directory to run a
++        leakage-free time-holdout validation without clobbering the real
++        caches under data/interim. The weather cache is exogenous (no leakage)
++        and always uses its own default location.
+ 
+     Returns:
+     Cleaned dataset with `station_number` replaced by one-hot columns
+@@ -90,14 +96,17 @@ def clean_data(dataset, is_train: bool, categorize_station = True, station_categ
+     # Average bikes per station (target-derived): on train this computes the
+     # per-station means and caches them; on test it reads that cache back.
+     # Done while station_number is still a plain int, before encoding below.
+-    dataset = add_avg_bikes_per_station(dataset, is_train=is_train)
++    dataset = add_avg_bikes_per_station(
++        dataset, is_train=is_train,
++        cache_path=os.path.join(cache_dir, "station_means.csv"),
++    )
+ 
+     # Station time-profiles (target-derived, same train->cache->test contract):
+     # the historical mean bikes per station broken down by half-hour-of-day and
+     # day-of-week. This is the strong recurring signal the team flagged as "not
+     # yet implemented" — a single per-station mean cannot express that a station
+     # is full at 03:00 and empty at 08:00. Built before station encoding.
+-    dataset = add_target_profile_features(dataset, is_train=is_train)
++    dataset = add_target_profile_features(dataset, is_train=is_train, cache_dir=cache_dir)
+ 
+     # One-hot encode station_number. Using pd.Categorical with explicit
+     # categories guarantees that train and test produce the same st_* columns
+diff --git a/src/model.py b/src/model.py
+index 1d942ec..6bb6311 100644
+--- a/src/model.py
++++ b/src/model.py
+@@ -659,6 +659,37 @@ def train_hyperparameters(
+     return best_params, search
+ 
+ 
++def recency_weights(datetimes, halflife_days=30.0):
++    """Exponential-decay sample weights that favour the most recent rows.
++
++    The Kaggle test window is a contiguous *future* block, and bike usage
++    drifts up into spring, so rows near the end of the training period are more
++    representative of the test period than the autumn/winter rows. Weighting
++    recent rows up nudges the model's overall level toward the test period and
++    directly counters the under-prediction that RMSLE punishes.
++
++    Weight of a row = 0.5 ** (age_in_days / halflife_days), where age is measured
++    from the most recent timestamp. `halflife_days=30` means a row one month
++    older than the newest counts half as much; pass a larger half-life for a
++    gentler tilt, or None to disable (returns all-ones).
++
++    Args:
++        datetimes: array-like / Series of row timestamps (parseable by pandas).
++        halflife_days: half-life of the decay in days. None -> uniform weights.
++
++    Returns:
++        1-D numpy array of non-negative weights, aligned with `datetimes`.
++    """
++    import numpy as np
++    import pandas as pd
++
++    ts = pd.to_datetime(pd.Series(datetimes).values)
++    if halflife_days is None:
++        return np.ones(len(ts), dtype="float64")
++    age_days = (ts.max() - ts) / np.timedelta64(1, "D")
++    return np.power(0.5, age_days / float(halflife_days)).astype("float64")
++
++
+ def train_final_model(
+     X,
+     y,
+@@ -667,6 +698,7 @@ def train_final_model(
+     sample_size=None,
+     random_state=42,
+     log_target=False,
++    sample_weight=None,
+     verbose=True,
+ ):
+     """Refit the chosen model with given hyperparameters on the data.
+@@ -679,31 +711,184 @@ def train_final_model(
+             same way.
+         sample_size: if set, fit on only the last `sample_size` rows (the most
+             recent data). Default None = use all of (X, y).
++        sample_weight: optional per-row weights (e.g. from `recency_weights`),
++            aligned with `X`/`y` *before* any `sample_size` trimming. Routed to
++            the underlying estimator's `fit` (through the log-target wrapper or
++            the target-encoding pipeline as needed).
+ 
+     Returns:
+         The fitted estimator.
+     """
++    import numpy as np
+     from sklearn.base import clone
++    from sklearn.pipeline import Pipeline
+ 
+     estimator, _ = _build_final_estimator(
+         X, model_name, random_state=random_state, log_target=log_target
+     )
+ 
++    sw = None if sample_weight is None else np.asarray(sample_weight, dtype="float64")
++
+     if sample_size is not None and sample_size < len(X):
+         X = X.iloc[-sample_size:]
+         y = y.iloc[-sample_size:]
++        if sw is not None:
++            sw = sw[-sample_size:]
+ 
+     if verbose:
+         print(
+             f"[train_final_model] refitting {model_name} on "
+-            f"rows={len(X):,}, features={X.shape[1]}, log_target={log_target}..."
++            f"rows={len(X):,}, features={X.shape[1]}, log_target={log_target}, "
++            f"weighted={sw is not None}..."
+         )
+         print(f"[train_final_model] params: {best_params}")
+ 
+     best_estimator = clone(estimator).set_params(**best_params)
+-    best_estimator.fit(X, y)
++
++    fit_kwargs = {}
++    if sw is not None:
++        # Route the weights to the actual regressor's fit(). A bare Pipeline
++        # (DT/RF with target encoding) needs the "model__" step prefix; the
++        # log-target TransformedTargetRegressor forwards fit params straight
++        # through to its inner regressor, so a plain "sample_weight" works there.
++        if isinstance(best_estimator, Pipeline):
++            fit_kwargs["model__sample_weight"] = sw
++        else:
++            fit_kwargs["sample_weight"] = sw
++
++    best_estimator.fit(X, y, **fit_kwargs)
+     return best_estimator
+ 
++
++def time_holdout_validation(
++    df_raw,
++    model_name,
++    best_params=None,
++    holdout_weeks=7,
++    log_target=True,
++    drop_cols=("id", "datetime", "name"),
++    target="bikes",
++    recency_halflife_days=None,
++    random_state=42,
++    cache_dir=None,
++    verbose=True,
++):
++    """Leakage-free forecast validation on a chronological holdout.
++
++    This is the honest local metric the project was missing. The benchmark /
++    nested-CV numbers are optimistic because the target-derived features
++    (`avg_bikes_per_station`, `tprof_*`) are computed on the *whole* training
++    frame before the folds are cut, so each validation row's feature already
++    "knows" its own target. That inflates CV and makes it disagree with the
++    Kaggle leaderboard.
++
++    Here the raw training data is split by time into an earlier `fit` part and
++    the last `holdout_weeks` as a pseudo-test block — the same shape as the
++    real train→test gap. `clean_data` is run with `is_train=True` on the fit
++    part (which *rebuilds the target caches from the fit part only*, into a
++    scratch directory) and with `is_train=False` on the holdout, so the holdout
++    features are mapped from the fit part exactly like the real test. The model
++    is then fit on the fit part and scored on the holdout with RMSLE.
++
++    Use it to compare feature/hyperparameter/weighting changes: a change that
++    lowers this RMSLE should move the leaderboard the same way.
++
++    Args:
++        df_raw: the RAW training dataframe (as read from the CSV, before any
++            cleaning), with `datetime`, `station_number` and `target` columns.
++        model_name: key from `get_model_grid()`.
++        best_params: params to set on the estimator; None fits library defaults.
++        holdout_weeks: size of the chronological holdout, in weeks.
++        recency_halflife_days: if set, fit with `recency_weights` of this
++            half-life (measured on the fit part). None = uniform weights.
++        cache_dir: scratch directory for the fit-part target caches. None uses
++            a fresh temporary directory that is cleaned up afterwards.
++
++    Returns:
++        Dict with keys {rmse, mae, rmsle, n_fit, n_holdout, cutoff} where
++        `cutoff` is the timestamp separating fit and holdout.
++    """
++    import shutil
++    import tempfile
++    from pathlib import Path
++
++    import numpy as np
++    import pandas as pd
++    from sklearn.metrics import (
++        mean_absolute_error, mean_squared_error, mean_squared_log_error,
++    )
++
++    try:
++        from src.data_cleaning import clean_data
++    except ImportError:  # when src/ is on the path directly
++        from data_cleaning import clean_data
++
++    df = df_raw.copy()
++    df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_localize(None)
++    df = df.sort_values("datetime")
++
++    cutoff = df["datetime"].max() - pd.Timedelta(weeks=holdout_weeks)
++    fit_raw = df[df["datetime"] <= cutoff]
++    hold_raw = df[df["datetime"] > cutoff]
++    if len(fit_raw) == 0 or len(hold_raw) == 0:
++        raise ValueError(
++            f"holdout_weeks={holdout_weeks} leaves an empty split "
++            f"(fit={len(fit_raw)}, holdout={len(hold_raw)})."
++        )
++
++    owns_dir = cache_dir is None
++    cache_dir = tempfile.mkdtemp(prefix="holdout_cache_") if owns_dir else cache_dir
++    try:
++        fit_clean = clean_data(fit_raw, is_train=True, cache_dir=cache_dir)
++        hold_clean = clean_data(hold_raw, is_train=False, cache_dir=cache_dir)
++
++        # The holdout keeps its rows (is_train=False), but it comes from the
++        # train file, so drop any residual NA target rows before scoring.
++        hold_clean = hold_clean[hold_clean[target].notna()]
++
++        X_fit, y_fit = data_split(fit_clean, target)
++        X_hold, y_hold = data_split(hold_clean, target)
++        fit_datetimes = X_fit["datetime"]
++
++        X_fit = prepare_features(X_fit, list(drop_cols))
++        X_hold = prepare_features(X_hold, list(drop_cols))
++
++        sw = (
++            recency_weights(fit_datetimes, recency_halflife_days)
++            if recency_halflife_days is not None else None
++        )
++
++        model = train_final_model(
++            X_fit, y_fit, model_name,
++            best_params=best_params or {},
++            log_target=log_target,
++            sample_weight=sw,
++            random_state=random_state,
++            verbose=verbose,
++        )
++
++        y_pred = np.maximum(0, model.predict(X_hold))
++        result = {
++            "rmse": float(np.sqrt(mean_squared_error(y_hold, y_pred))),
++            "mae": float(mean_absolute_error(y_hold, y_pred)),
++            "rmsle": float(np.sqrt(mean_squared_log_error(y_hold, y_pred))),
++            "n_fit": int(len(X_fit)),
++            "n_holdout": int(len(X_hold)),
++            "cutoff": cutoff,
++        }
++    finally:
++        if owns_dir:
++            shutil.rmtree(cache_dir, ignore_errors=True)
++
++    if verbose:
++        print(
++            f"[time_holdout_validation] cutoff={cutoff}  "
++            f"fit={result['n_fit']:,}  holdout={result['n_holdout']:,}  "
++            f"RMSLE={result['rmsle']:.4f}  RMSE={result['rmse']:.3f}  "
++            f"MAE={result['mae']:.3f}"
++        )
++    return result
++
+ def evaluate(model, X, y):
+     """Return a dict {rmse, mae, rmsle} for predictions on (X, y)."""
+ 
+-- 
+2.43.0
+
